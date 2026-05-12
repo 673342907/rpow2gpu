@@ -47,13 +47,22 @@ import taichi as ti
 # --------------------------------------------------------------------------
 API_BASE = os.environ.get("RPOW_API_BASE", "https://api.rpow2.com")
 ORIGIN = os.environ.get("RPOW_ORIGIN", "https://rpow2.com")
-# 站点可能拒绝明显「矿工」UA；默认模拟桌面 Chrome（Linux）。可在 DevTools → Network
-# 里复制任一条 api 请求的 User-Agent 到环境变量 RPOW_USER_AGENT。
+# 与下列 Sec-CH-UA _major 保持一致；也可用 RPOW_USER_AGENT 直接覆盖为你在 DevTools 里看到的整行。
+_CHROME_MAJOR = os.environ.get("RPOW_CHROME_MAJOR", "133")
 _DEFAULT_BROWSER_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
+    f"Chrome/{_CHROME_MAJOR}.0.0.0 Safari/537.36"
 )
 USER_AGENT = os.environ.get("RPOW_USER_AGENT", _DEFAULT_BROWSER_UA)
+# API 请求更接近从挖矿页发起的 fetch；可被 RPOW_REFERER 覆盖。
+REFERER = os.environ.get("RPOW_REFERER", f"{ORIGIN}/#/mine")
+SEC_CH_UA = os.environ.get(
+    "RPOW_SEC_CH_UA",
+    f'"Google Chrome";v="{_CHROME_MAJOR}", "Chromium";v="{_CHROME_MAJOR}", '
+    f'"Not(A:Brand";v="99"',
+)
+SEC_CH_UA_MOBILE = os.environ.get("RPOW_SEC_CH_UA_MOBILE", "?0")
+SEC_CH_UA_PLATFORM = os.environ.get("RPOW_SEC_CH_UA_PLATFORM", '"Linux"')
 
 
 # --------------------------------------------------------------------------
@@ -67,17 +76,18 @@ class ApiError(Exception):
 
 
 def http(method: str, path: str, cookie: str, body=None, timeout: float = 60.0):
-    ref = f"{ORIGIN}/"
     headers = {
         "cookie": cookie,
         "origin": ORIGIN,
-        "referer": ref,
+        "referer": REFERER,
         "user-agent": USER_AGENT,
-        "accept": "application/json",
-        "accept-language": "en-US,en;q=0.9",
-        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Linux"',
+        "accept": "application/json, text/plain, */*",
+        "accept-language": os.environ.get(
+            "RPOW_ACCEPT_LANGUAGE", "zh-CN,zh;q=0.9,en;q=0.8"
+        ),
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
         "sec-fetch-site": "same-site",
         "sec-fetch-mode": "cors",
         "sec-fetch-dest": "empty",
@@ -102,32 +112,34 @@ def http(method: str, path: str, cookie: str, body=None, timeout: float = 60.0):
         raise ApiError(e.code, parsed) from None
 
 
-def normalize_rpow_cookie(raw: str) -> str:
-    """Parse browser DevTools cookie copy: full header, or only ``rpow_session=`` pair.
+def normalize_cookie_header_value(raw: str) -> tuple[str, str]:
+    """Strip wrappers; keep **all** ``name=value`` pairs (e.g. ``cf_clearance`` + ``rpow_session``).
 
-    Strips BOM/whitespace, optional ``Cookie:`` prefix, and picks the
-    ``rpow_session=...`` segment from ``;``-separated cookie strings.
+    Cloudflare / 站点常要求完整 Cookie，不能只发 ``rpow_session``。若缺少 ``rpow_session`` 则失败。
+
+    Returns ``(cookie_string, "")`` on success, or ``("", reason)``.
     """
     if not raw:
-        return ""
-    s = raw.lstrip("\ufeff").strip()
-    line = s.splitlines()[0].strip()
+        return "", "empty"
+    line = raw.lstrip("\ufeff").strip().splitlines()[0].strip()
     if len(line) >= 2 and line[0] == line[-1] and line[0] in "'\"":
         line = line[1:-1].strip()
     if line.lower().startswith("cookie:"):
         line = line.split(":", 1)[1].strip()
+
+    has_session = False
+    parts_out: list[str] = []
     for part in line.split(";"):
         p = part.strip()
-        if "=" not in p:
+        if not p or "=" not in p:
             continue
-        name, value = p.split("=", 1)
-        if name.strip().lower() == "rpow_session":
-            return f"rpow_session={value}"
-    if "=" in line:
-        name, value = line.split("=", 1)
-        if name.strip().lower() == "rpow_session":
-            return f"rpow_session={value}"
-    return ""
+        name = p.split("=", 1)[0].strip().lower()
+        if name == "rpow_session":
+            has_session = True
+        parts_out.append(p)
+    if not has_session:
+        return "", "no rpow_session"
+    return "; ".join(parts_out), ""
 
 
 def _cookie_format_hint(raw: str) -> str:
@@ -469,8 +481,9 @@ def main():
     p.add_argument(
         "--cookie-file",
         metavar="PATH",
-        help="read cookie from file (single line, e.g. rpow_session=...). "
-             "Overrides --cookie / $RPOW_COOKIE when set.",
+        help="read cookie from file: paste the full **Cookie** header value from "
+             "DevTools → Network (must include rpow_session; usually also "
+             "cf_clearance for Cloudflare).",
     )
     p.add_argument(
         "--user-agent",
@@ -519,20 +532,19 @@ def main():
         except OSError as e:
             sys.exit(f"cannot read --cookie-file: {e}")
 
-    args.cookie = normalize_rpow_cookie(cookie_raw)
+    args.cookie, _ = normalize_cookie_header_value(cookie_raw)
 
     if not args.cookie:
         if not cookie_raw.strip():
             sys.exit(
                 "no cookie supplied. set $RPOW_COOKIE or pass --cookie / --cookie-file. "
-                "tip: in your browser, DevTools → Network → click any /api request "
-                "→ copy the 'cookie' header (must include rpow_session=...)."
+                "tip: DevTools → Network → pick a request to rpow2.com or api.rpow2.com → "
+                "copy the full **Cookie** request header (cf_clearance + rpow_session)."
             )
         sys.exit(
-            "could not find rpow_session= in cookie text. "
-            "paste the full 'cookie' request header from DevTools (multiple "
-            "cookies separated with '; ' are OK), or a single line "
-            f"rpow_session=....\n({_cookie_format_hint(cookie_raw)})"
+            "cookie text must include rpow_session=. Paste the **entire** Cookie header "
+            "from DevTools (not only the JWT); Cloudflare needs cf_clearance too.\n"
+            f"({_cookie_format_hint(cookie_raw)})"
         )
     stats_path = None if args.no_stats else args.stats_file
     pid_file = args.pid_file.strip() if args.pid_file else None
