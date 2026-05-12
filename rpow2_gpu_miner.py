@@ -47,7 +47,13 @@ import taichi as ti
 # --------------------------------------------------------------------------
 API_BASE = os.environ.get("RPOW_API_BASE", "https://api.rpow2.com")
 ORIGIN = os.environ.get("RPOW_ORIGIN", "https://rpow2.com")
-USER_AGENT = "rpow2-gpu-miner/1.0 (+https://github.com/ImMike/rpow2-gpu-miner)"
+# 站点可能拒绝明显「矿工」UA；默认模拟桌面 Chrome（Linux）。可在 DevTools → Network
+# 里复制任一条 api 请求的 User-Agent 到环境变量 RPOW_USER_AGENT。
+_DEFAULT_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+USER_AGENT = os.environ.get("RPOW_USER_AGENT", _DEFAULT_BROWSER_UA)
 
 
 # --------------------------------------------------------------------------
@@ -61,11 +67,20 @@ class ApiError(Exception):
 
 
 def http(method: str, path: str, cookie: str, body=None, timeout: float = 60.0):
+    ref = f"{ORIGIN}/"
     headers = {
         "cookie": cookie,
         "origin": ORIGIN,
+        "referer": ref,
         "user-agent": USER_AGENT,
         "accept": "application/json",
+        "accept-language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Linux"',
+        "sec-fetch-site": "same-site",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
     }
     data = None
     if body is not None:
@@ -441,6 +456,7 @@ def solve(prefix_hex, target_bits, n_threads, iters, attempt_cap):
 # Live mining loop.
 # --------------------------------------------------------------------------
 def main():
+    global USER_AGENT
     p = argparse.ArgumentParser(
         description="GPU-accelerated rpow2 miner (Vulkan/Taichi).",
     )
@@ -455,6 +471,12 @@ def main():
         metavar="PATH",
         help="read cookie from file (single line, e.g. rpow_session=...). "
              "Overrides --cookie / $RPOW_COOKIE when set.",
+    )
+    p.add_argument(
+        "--user-agent",
+        metavar="STR",
+        help="override HTTP User-Agent (env RPOW_USER_AGENT also applies at startup; "
+             "this flag wins if set)",
     )
     p.add_argument(
         "--stats-file",
@@ -485,6 +507,9 @@ def main():
     p.add_argument("--quiet", action="store_true",
                    help="only print summary, no per-mint lines")
     args = p.parse_args()
+
+    if args.user_agent:
+        USER_AGENT = args.user_agent
 
     cookie_raw = (args.cookie or "").strip()
     if args.cookie_file:
