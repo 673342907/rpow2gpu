@@ -87,6 +87,52 @@ def http(method: str, path: str, cookie: str, body=None, timeout: float = 60.0):
         raise ApiError(e.code, parsed) from None
 
 
+def normalize_rpow_cookie(raw: str) -> str:
+    """Parse browser DevTools cookie copy: full header, or only ``rpow_session=`` pair.
+
+    Strips BOM/whitespace, optional ``Cookie:`` prefix, and picks the
+    ``rpow_session=...`` segment from ``;``-separated cookie strings.
+    """
+    if not raw:
+        return ""
+    s = raw.lstrip("\ufeff").strip()
+    line = s.splitlines()[0].strip()
+    if len(line) >= 2 and line[0] == line[-1] and line[0] in "'\"":
+        line = line[1:-1].strip()
+    if line.lower().startswith("cookie:"):
+        line = line.split(":", 1)[1].strip()
+    for part in line.split(";"):
+        p = part.strip()
+        if "=" not in p:
+            continue
+        name, value = p.split("=", 1)
+        if name.strip().lower() == "rpow_session":
+            return f"rpow_session={value}"
+    if "=" in line:
+        name, value = line.split("=", 1)
+        if name.strip().lower() == "rpow_session":
+            return f"rpow_session={value}"
+    return ""
+
+
+def _cookie_format_hint(raw: str) -> str:
+    """Short safe hint if parsing failed (no cookie value leaked)."""
+    keys = []
+    blob = raw.lstrip("\ufeff").strip().splitlines()[0].strip()
+    if blob.lower().startswith("cookie:"):
+        blob = blob.split(":", 1)[1].strip()
+    for part in blob.split(";"):
+        p = part.strip()
+        if "=" in p:
+            keys.append(p.split("=", 1)[0].strip()[:32])
+    if keys:
+        return "saw cookie name(s): " + ", ".join(keys)
+    preview = blob[:60].replace("\n", " ")
+    if len(blob) > 60:
+        preview += "..."
+    return f"first line starts with: {preview!r}"
+
+
 def atomic_write_json(path: str, obj: dict) -> None:
     dname = os.path.dirname(os.path.abspath(path))
     if dname:
@@ -440,23 +486,29 @@ def main():
                    help="only print summary, no per-mint lines")
     args = p.parse_args()
 
+    cookie_raw = (args.cookie or "").strip()
     if args.cookie_file:
         try:
             with open(args.cookie_file, encoding="utf-8") as f:
-                args.cookie = f.read().strip()
+                cookie_raw = f.read()
         except OSError as e:
             sys.exit(f"cannot read --cookie-file: {e}")
 
-    if not args.cookie:
-        sys.exit(
-            "no cookie supplied. set $RPOW_COOKIE or pass --cookie / --cookie-file. "
-            "tip: in your browser, DevTools → Network → click any /api request "
-            "→ copy the 'cookie' header (starts with 'rpow_session=')."
-        )
-    if not args.cookie.startswith("rpow_session="):
-        sys.exit("cookie does not start with 'rpow_session='. paste the full "
-                 "header value, not just the JWT-looking part.")
+    args.cookie = normalize_rpow_cookie(cookie_raw)
 
+    if not args.cookie:
+        if not cookie_raw.strip():
+            sys.exit(
+                "no cookie supplied. set $RPOW_COOKIE or pass --cookie / --cookie-file. "
+                "tip: in your browser, DevTools → Network → click any /api request "
+                "→ copy the 'cookie' header (must include rpow_session=...)."
+            )
+        sys.exit(
+            "could not find rpow_session= in cookie text. "
+            "paste the full 'cookie' request header from DevTools (multiple "
+            "cookies separated with '; ' are OK), or a single line "
+            f"rpow_session=....\n({_cookie_format_hint(cookie_raw)})"
+        )
     stats_path = None if args.no_stats else args.stats_file
     pid_file = args.pid_file.strip() if args.pid_file else None
 
