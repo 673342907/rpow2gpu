@@ -554,10 +554,14 @@ def main():
         status, me = http("GET", "/me", args.cookie)
     except ApiError as e:
         sys.exit(f"auth check failed: {e}")
-    if status != 200 or not me or "email" not in me:
+    if status != 200 or not me or not isinstance(me, dict) or "email" not in me:
         sys.exit(f"unexpected /me response: {me}")
-    print(f"signed in: {me['email']}  balance={me['balance']}  minted={me['minted']}",
-          file=sys.stderr, flush=True)
+    print(
+        f"signed in: {me.get('email', '?')}  balance={me.get('balance', '—')}  "
+        f"minted={me.get('minted', '—')}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     cum0 = load_cumulative_minted(stats_path) if stats_path else 0
     stats = MinerStats(stats_path, cum0) if stats_path else None
