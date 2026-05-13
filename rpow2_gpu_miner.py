@@ -387,7 +387,9 @@ def mine_kernel(
     iters: ti.i32,
     base_nonce: ti.u32,
     p0: ti.u32, p1: ti.u32, p2: ti.u32, p3: ti.u32,
-    bit_mask: ti.u32,
+    target_bits: ti.i32,
+    bit_mask_lo: ti.u32,
+    bit_mask_hi: ti.u32,
     result: ti.types.ndarray(dtype=ti.u32, ndim=1),  # [found, nonce, _pad]
 ):
     for gid in range(n_threads):
@@ -431,11 +433,18 @@ def mine_kernel(
                 d = c; c = b; b = a
                 a = temp1 + temp2
 
+            h6 = H0[6] + g
             h7 = H0[7] + h
-            # For target_bits in [1..32], "trailing zero bits >= target" iff
-            # (h7 & ((1<<bits)-1)) == 0, because h7 is the last 4 digest bytes
-            # and the rpow2 trailing-zero count starts at byte[31].
-            if (h7 & bit_mask) == ti.u32(0):
+            # trailing_zero_bits starts from digest byte[31] (LSB of h7).
+            # bits<=32: check low bits of h7.
+            # bits>32: require h7==0 and low(bits-32) bits of h6==0.
+            ok = ti.u32(0)
+            if target_bits <= 32:
+                ok = ti.u32(1) if (h7 & bit_mask_lo) == ti.u32(0) else ti.u32(0)
+            else:
+                cond = (h7 == ti.u32(0)) and ((h6 & bit_mask_hi) == ti.u32(0))
+                ok = ti.u32(1) if cond else ti.u32(0)
+            if ok == ti.u32(1):
                 prev = ti.atomic_or(result[0], ti.u32(1))
                 if prev == ti.u32(0):
                     result[1] = nonce
@@ -469,10 +478,16 @@ def verify(prefix_hex: str, nonce: int, target_bits: int) -> bool:
 
 def solve(prefix_hex, target_bits, n_threads, iters, attempt_cap):
     """Return (winning_nonce, total_attempts). Raises RuntimeError on cap."""
-    if not (1 <= target_bits <= 31):
-        raise ValueError(f"target_bits must be 1..31, got {target_bits}")
+    if not (1 <= target_bits <= 64):
+        raise ValueError(f"target_bits must be 1..64, got {target_bits}")
     p0, p1, p2, p3 = _hex_prefix_to_uint32_be(prefix_hex)
-    bit_mask = np.uint32((1 << target_bits) - 1)
+    if target_bits <= 32:
+        bit_mask_lo = np.uint32((1 << target_bits) - 1) if target_bits < 32 else np.uint32(0xFFFFFFFF)
+        bit_mask_hi = np.uint32(0)
+    else:
+        hi = target_bits - 32
+        bit_mask_lo = np.uint32(0xFFFFFFFF)
+        bit_mask_hi = np.uint32((1 << hi) - 1) if hi < 32 else np.uint32(0xFFFFFFFF)
     base = np.uint32(0)
     total = 0
     result_buf = np.zeros(3, dtype=np.uint32)
@@ -481,7 +496,7 @@ def solve(prefix_hex, target_bits, n_threads, iters, attempt_cap):
         mine_kernel(
             n_threads, iters, int(base),
             np.uint32(p0), np.uint32(p1), np.uint32(p2), np.uint32(p3),
-            bit_mask, result_buf,
+            int(target_bits), bit_mask_lo, bit_mask_hi, result_buf,
         )
         ti.sync()
         total += n_threads * iters
@@ -609,7 +624,7 @@ def main():
     mine_kernel(
         args.threads, args.iters, np.uint32(0),
         np.uint32(0), np.uint32(0), np.uint32(0), np.uint32(0),
-        np.uint32(0xFFFFFFFF), warm,
+        32, np.uint32(0xFFFFFFFF), np.uint32(0), warm,
     )
     ti.sync()
     print("kernel ready.\n", file=sys.stderr, flush=True)
