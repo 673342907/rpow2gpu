@@ -385,23 +385,33 @@ def _rotr(x: ti.u32, n: ti.i32) -> ti.u32:
 def mine_kernel(
     n_threads: ti.i32,
     iters: ti.i32,
-    base_nonce: ti.u32,
+    base_nonce_lo: ti.u32,
+    base_nonce_hi: ti.u32,
     p0: ti.u32, p1: ti.u32, p2: ti.u32, p3: ti.u32,
     target_bits: ti.i32,
     bit_mask_lo: ti.u32,
     bit_mask_hi: ti.u32,
-    result: ti.types.ndarray(dtype=ti.u32, ndim=1),  # [found, nonce, _pad]
+    result: ti.types.ndarray(dtype=ti.u32, ndim=1),  # [found, nonce_lo, nonce_hi]
 ):
     for gid in range(n_threads):
-        local_base = base_nonce + ti.u32(gid) * ti.u32(iters)
+        gid_off = ti.u32(gid) * ti.u32(iters)
+        local_lo = base_nonce_lo + gid_off
+        carry_gid = ti.u32(1) if local_lo < base_nonce_lo else ti.u32(0)
+        local_hi = base_nonce_hi + carry_gid
         for k in range(iters):
-            nonce = local_base + ti.u32(k)
+            nonce_lo = local_lo + ti.u32(k)
+            carry_k = ti.u32(1) if nonce_lo < local_lo else ti.u32(0)
+            nonce_hi = local_hi + carry_k
             # SHA-256 reads each 4-byte word big-endian; nonce bytes are LE,
-            # so W[4] is the byte-swap of nonce_lo.
-            w4 = ((nonce & ti.u32(0xff)) << 24) \
-                | (((nonce >> 8) & ti.u32(0xff)) << 16) \
-                | (((nonce >> 16) & ti.u32(0xff)) << 8) \
-                | ((nonce >> 24) & ti.u32(0xff))
+            # so W[4]/W[5] are byte-swapped nonce_lo/nonce_hi.
+            w4 = ((nonce_lo & ti.u32(0xff)) << 24) \
+                | (((nonce_lo >> 8) & ti.u32(0xff)) << 16) \
+                | (((nonce_lo >> 16) & ti.u32(0xff)) << 8) \
+                | ((nonce_lo >> 24) & ti.u32(0xff))
+            w5 = ((nonce_hi & ti.u32(0xff)) << 24) \
+                | (((nonce_hi >> 8) & ti.u32(0xff)) << 16) \
+                | (((nonce_hi >> 16) & ti.u32(0xff)) << 8) \
+                | ((nonce_hi >> 24) & ti.u32(0xff))
 
             W = ti.Vector.zero(ti.u32, 64)
             W[0] = p0
@@ -409,7 +419,7 @@ def mine_kernel(
             W[2] = p2
             W[3] = p3
             W[4] = w4
-            W[5] = ti.u32(0)
+            W[5] = w5
             W[6] = ti.u32(0x80000000)  # SHA-256 padding marker
             W[15] = ti.u32(192)        # bit length: 24 bytes = 192 bits
 
@@ -447,7 +457,8 @@ def mine_kernel(
             if ok == ti.u32(1):
                 prev = ti.atomic_or(result[0], ti.u32(1))
                 if prev == ti.u32(0):
-                    result[1] = nonce
+                    result[1] = nonce_lo
+                    result[2] = nonce_hi
 
 
 def _hex_prefix_to_uint32_be(prefix_hex: str):
@@ -488,27 +499,30 @@ def solve(prefix_hex, target_bits, n_threads, iters, attempt_cap):
         hi = target_bits - 32
         bit_mask_lo = np.uint32(0xFFFFFFFF)
         bit_mask_hi = np.uint32((1 << hi) - 1) if hi < 32 else np.uint32(0xFFFFFFFF)
-    base = np.uint32(0)
+    base = 0
     total = 0
     result_buf = np.zeros(3, dtype=np.uint32)
+    span = int(n_threads) * int(iters)
     while total < attempt_cap:
         result_buf.fill(0)
+        base_lo = np.uint32(base & 0xFFFFFFFF)
+        base_hi = np.uint32((base >> 32) & 0xFFFFFFFF)
         mine_kernel(
-            n_threads, iters, int(base),
+            n_threads, iters, base_lo, base_hi,
             np.uint32(p0), np.uint32(p1), np.uint32(p2), np.uint32(p3),
             int(target_bits), bit_mask_lo, bit_mask_hi, result_buf,
         )
         ti.sync()
-        total += n_threads * iters
+        total += span
         if int(result_buf[0]) == 1:
-            nonce = int(result_buf[1])
+            nonce = (int(result_buf[2]) << 32) | int(result_buf[1])
             if not verify(prefix_hex, nonce, target_bits):
                 raise RuntimeError(
                     f"kernel returned nonce={nonce} that does not verify on CPU; "
                     "this should never happen — please file a bug"
                 )
             return nonce, total
-        base = (base + np.uint32(n_threads * iters)) & np.uint32(0xFFFFFFFF)
+        base = (base + span) & ((1 << 64) - 1)
     raise RuntimeError(f"attempt_cap reached after {total} hashes")
 
 
@@ -622,7 +636,7 @@ def main():
     print("compiling SPIR-V kernel (first launch only)...", file=sys.stderr, flush=True)
     warm = np.zeros(3, dtype=np.uint32)
     mine_kernel(
-        args.threads, args.iters, np.uint32(0),
+        args.threads, args.iters, np.uint32(0), np.uint32(0),
         np.uint32(0), np.uint32(0), np.uint32(0), np.uint32(0),
         32, np.uint32(0xFFFFFFFF), np.uint32(0), warm,
     )
