@@ -75,6 +75,38 @@ class ApiError(Exception):
         self.body = body
 
 
+def _parse_retry_after(body) -> float | None:
+    if not isinstance(body, dict):
+        return None
+    r = body.get("retry_after")
+    if r is None:
+        return None
+    try:
+        return float(r)
+    except (TypeError, ValueError):
+        return None
+
+
+def _http_error_backoff_seconds(status: int, body, cf_429_streak: int) -> float:
+    """How long to sleep after a rate-limited or failed API call."""
+    ra = _parse_retry_after(body)
+    cap = float(os.environ.get("RPOW_MAX_RATE_LIMIT_SLEEP", "300"))
+    if status == 429:
+        if isinstance(body, dict) and body.get("cloudflare_error"):
+            base = ra if ra is not None else 30.0
+            base = max(base, 30.0)
+            mult = 2 ** min(max(cf_429_streak - 1, 0), 4)
+            return min(base * mult, cap)
+        if isinstance(body, dict) and body.get("error") == "COOLDOWN":
+            return max(ra if ra is not None else 4.0, 1.0)
+        return max(ra if ra is not None else 15.0, 5.0)
+    if status == 503:
+        return max(ra if ra is not None else 10.0, 2.0)
+    if ra is not None:
+        return max(ra, 1.0)
+    return 5.0 if status >= 500 else 2.0
+
+
 def http(method: str, path: str, cookie: str, body=None, timeout: float = 60.0):
     headers = {
         "cookie": cookie,
@@ -443,8 +475,9 @@ def solve(prefix_hex, target_bits, n_threads, iters, attempt_cap):
     bit_mask = np.uint32((1 << target_bits) - 1)
     base = np.uint32(0)
     total = 0
+    result_buf = np.zeros(3, dtype=np.uint32)
     while total < attempt_cap:
-        result_buf = np.zeros(3, dtype=np.uint32)
+        result_buf.fill(0)
         mine_kernel(
             n_threads, iters, int(base),
             np.uint32(p0), np.uint32(p1), np.uint32(p2), np.uint32(p3),
@@ -637,6 +670,8 @@ def main():
     signal.signal(signal.SIGINT,  stop_summary)
     signal.signal(signal.SIGTERM, stop_summary)
 
+    cf_429_streak = 0
+
     while True:
         if args.rounds and minted >= args.rounds:
             break
@@ -650,9 +685,28 @@ def main():
             failures += 1
             if stats:
                 stats.note_failure()
-            print(f"[!] /challenge failed: {e}", file=sys.stderr, flush=True)
-            time.sleep(1.0)
+            is_cf_429 = (
+                e.status == 429
+                and isinstance(e.body, dict)
+                and e.body.get("cloudflare_error")
+            )
+            if is_cf_429:
+                cf_429_streak += 1
+            else:
+                cf_429_streak = 0
+            wait = _http_error_backoff_seconds(e.status, e.body, cf_429_streak)
+            print(
+                f"[!] /challenge failed: {e}  (sleep {wait:.1f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
+            if stats:
+                stats.set_phase("rate_limited", f"retry in {wait:.0f}s")
+                stats.flush()
+            time.sleep(wait)
             continue
+
+        cf_429_streak = 0
 
         cid    = ch["challenge_id"]
         prefix = ch["nonce_prefix"]
@@ -693,17 +747,34 @@ def main():
             failures += 1
             if stats:
                 stats.note_failure()
-            print(f"[!] /mint failed (challenge {cid}): {e}",
-                  file=sys.stderr, flush=True)
+            is_cf_429 = (
+                e.status == 429
+                and isinstance(e.body, dict)
+                and e.body.get("cloudflare_error")
+            )
+            if is_cf_429:
+                cf_429_streak += 1
+            else:
+                cf_429_streak = 0
+            wait = _http_error_backoff_seconds(e.status, e.body, cf_429_streak)
+            print(
+                f"[!] /mint failed (challenge {cid}): {e}  (sleep {wait:.1f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(wait)
             continue
 
         minted += 1
         if stats:
             stats.note_mint_success()
             try:
-                _, me2 = http("GET", "/me", args.cookie)
-                if me2:
-                    stats.set_account(me2)
+                every = int(os.environ.get("RPOW_ME_REFRESH_EVERY", "5"))
+                do_me = every <= 0 or minted == 1 or (minted % every == 0)
+                if do_me:
+                    _, me2 = http("GET", "/me", args.cookie)
+                    if me2:
+                        stats.set_account(me2)
             except ApiError:
                 pass
             stats.set_phase("idle", "mint ok, next challenge")
